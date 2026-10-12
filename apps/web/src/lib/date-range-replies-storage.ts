@@ -41,6 +41,43 @@ export async function cachePut<T>(key: string, value: T): Promise<void> {
 	});
 }
 
+export async function cachePutMany<T>(
+	entries: Array<{ key: string; value: T }>,
+): Promise<void> {
+	if (entries.length === 0) return;
+	const db = await openDb();
+	return new Promise((resolve, reject) => {
+		const tx = db.transaction(STORE, "readwrite");
+		const store = tx.objectStore(STORE);
+		for (const entry of entries) store.put(entry.value, entry.key);
+		tx.oncomplete = () => resolve();
+		tx.onerror = () => reject(tx.error);
+		tx.onabort = () => reject(tx.error);
+	});
+}
+
+export async function cacheEntriesPrefix<T>(
+	prefix: string,
+): Promise<Array<{ key: string; value: T }>> {
+	const db = await openDb();
+	return new Promise((resolve, reject) => {
+		const entries: Array<{ key: string; value: T }> = [];
+		const tx = db.transaction(STORE, "readonly");
+		const request = tx
+			.objectStore(STORE)
+			.openCursor(IDBKeyRange.bound(prefix, `${prefix}\uffff`));
+		request.onsuccess = () => {
+			const cursor = request.result;
+			if (cursor) {
+				entries.push({ key: String(cursor.key), value: cursor.value as T });
+				cursor.continue();
+			}
+		};
+		tx.oncomplete = () => resolve(entries);
+		tx.onerror = () => reject(tx.error);
+	});
+}
+
 export async function cacheDeletePrefix(prefix: string): Promise<number> {
 	const db = await openDb();
 	return new Promise((resolve, reject) => {

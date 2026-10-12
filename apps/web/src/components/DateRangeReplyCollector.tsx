@@ -2,50 +2,50 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { resolveApiBaseUrl } from "../lib/backend.ts";
 import {
 	abortError,
-	chinaDateBounds,
-	collectPages,
+	completionStatus,
+	createEmptyProgress,
+	createFirstFloorResolver,
+	createReplyClassifier,
 	type DateReplyPost,
 	defaultDateRange,
-	type FailedPage,
-	filterDate,
+	type HistoricalTaskQuery,
+	type HistoricalTaskV3,
 	isAbortError,
+	isRetryableStatus,
 	locatePages,
-	type PageCache,
+	maxEndDateForStart,
+	migrateHistoricalTask,
 	PageRequestError,
-	replyKind,
-	uniquePosts,
+	type PipelineProgress,
+	pageFingerprint,
+	pageMappingDrifted,
+	postIdentity,
+	type ReplyKind,
+	RequestScheduler,
+	runClassificationPool,
+	runStreamingReplyPipeline,
+	type StreamingPipelineResult,
+	validateDateRange,
 	withExponentialRetry,
 } from "../lib/date-range-replies-core.ts";
 import {
 	cacheDeletePrefix,
+	cacheEntriesPrefix,
 	cacheGet,
 	cachePut,
+	cachePutMany,
 } from "../lib/date-range-replies-storage.ts";
 import styles from "./DateRangeReplyCollector.module.css";
 
-type TaskPhase =
-	| "locating"
-	| "collecting"
-	| "classifying"
-	| "paused"
-	| "partial"
-	| "complete";
+type Method = "id" | "uid" | "un";
+type RunMode = "all" | "failed" | "unknown";
+type CandidateStatus = ReplyKind | "pending";
 
-interface TaskRecord {
-	version: 2;
-	query: {
-		method: Method;
-		id: string;
-		startDate: string;
-		endDate: string;
-	};
-	phase: TaskPhase;
-	fromPage?: number;
-	toPage?: number;
-	checkedPages: number[];
-	failedPages: Record<string, FailedPage>;
-	probeCount: number;
+interface PersistedCandidate {
+	post: DateReplyPost;
+	status: CandidateStatus;
 	updatedAt: number;
+	error?: string;
 }
 
 interface Summary {
@@ -66,8 +66,6 @@ interface Props {
 	method: Method;
 	id: string;
 }
-
-type Method = "id" | "uid" | "un";
 
 const EMPTY_SUMMARY: Summary = {
 	downloaded: 0,
@@ -90,12 +88,28 @@ function taskScope(
 	return `${method}:${encodeURIComponent(id)}:${startDate}:${endDate}`;
 }
 
-function pageKey(scope: string, page: number): string {
+function taskKey(scope: string): string {
+	return `date-replies:task:${scope}`;
+}
+
+function legacyPageKey(scope: string, page: number): string {
 	return `date-replies:page:${scope}:${page}`;
 }
 
-function taskKey(scope: string): string {
-	return `date-replies:task:${scope}`;
+function pageKey(scope: string, snapshotId: string, page: number): string {
+	return `date-replies:page:${scope}:${snapshotId}:${page}`;
+}
+
+function candidatePrefix(scope: string, snapshotId: string): string {
+	return `date-replies:candidate:${scope}:${snapshotId}:`;
+}
+
+function candidateKey(
+	scope: string,
+	snapshotId: string,
+	post: DateReplyPost,
+): string {
+	return `${candidatePrefix(scope, snapshotId)}${encodeURIComponent(postIdentity(post))}`;
 }
 
 function resultKey(scope: string): string {
@@ -106,14 +120,32 @@ function firstFloorKey(threadId: string): string {
 	return `date-replies:first-floor:${threadId}`;
 }
 
+function newSnapshotId(): string {
+	return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function rangePages(fromPage: number, toPage: number): number[] {
+	if (toPage < fromPage) return [];
+	return Array.from(
+		{ length: toPage - fromPage + 1 },
+		(_, index) => fromPage + index,
+	);
+}
+
 function csvSafe(value: unknown): string {
 	let text = String(value ?? "");
 	if (/^\s*[=+\-@]/.test(text)) text = `'${text}`;
 	return `"${text.replaceAll('"', '""')}"`;
 }
 
-function saveCsv(data: DateReplyPost[], startDate: string, endDate: string) {
+function saveCsv(
+	data: DateReplyPost[],
+	startDate: string,
+	endDate: string,
+	complete: boolean,
+) {
 	const lines = [
+		["任务状态", complete ? "COMPLETE" : "PARTIAL"].map(csvSafe).join(","),
 		[
 			"时间（中国时区）",
 			"贴吧",
@@ -138,13 +170,12 @@ function saveCsv(data: DateReplyPost[], startDate: string, endDate: string) {
 		hour12: false,
 	});
 	for (const post of data) {
-		const kind = post.affiliated ? "楼中楼" : "楼层回复";
 		const url = `https://tieba.baidu.com/p/${encodeURIComponent(post.threadId)}?pid=${encodeURIComponent(post.cid)}#${encodeURIComponent(post.cid)}`;
 		lines.push(
 			[
 				formatter.format(new Date(post.createTime * 1_000)),
 				post.forumName,
-				kind,
+				post.affiliated ? "楼中楼" : "楼层回复",
 				post.content,
 				post.threadId,
 				post.postId,
@@ -195,49 +226,76 @@ function validPosts(raw: unknown): DateReplyPost[] {
 	return raw as DateReplyPost[];
 }
 
-async function requestJson<T>(url: string, signal: AbortSignal): Promise<T> {
+function retryAfterMs(response: Response): number | undefined {
+	const value = response.headers.get("Retry-After");
+	if (!value) return undefined;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+	const date = Date.parse(value);
+	return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+}
+
+async function requestJson<T>(
+	url: string,
+	signal: AbortSignal,
+	scheduler: RequestScheduler,
+): Promise<T> {
 	return withExponentialRetry(
-		async () => {
-			if (signal.aborted) throw abortError();
-			const attemptController = new AbortController();
-			let timedOut = false;
-			const relayAbort = () => attemptController.abort();
-			signal.addEventListener("abort", relayAbort, { once: true });
-			const timer = setTimeout(() => {
-				timedOut = true;
-				attemptController.abort();
-			}, REQUEST_TIMEOUT_MS);
-			try {
-				const response = await fetch(url, {
-					method: "GET",
-					cache: "no-store",
-					signal: attemptController.signal,
-				});
-				if (!response.ok) {
-					throw new PageRequestError(
-						`HTTP ${response.status}：${new URL(url).pathname}${new URL(url).search}`,
-						{
-							status: response.status,
-							retryable: response.status === 429 || response.status >= 500,
-						},
-					);
-				}
-				return (await response.json()) as T;
-			} catch (error) {
+		async () =>
+			scheduler.schedule(async () => {
 				if (signal.aborted) throw abortError();
-				if (error instanceof PageRequestError) throw error;
-				throw new PageRequestError(
-					timedOut
-						? `请求超时（${REQUEST_TIMEOUT_MS / 1_000} 秒）：${new URL(url).pathname}`
-						: `网络请求失败：${error instanceof Error ? error.message : String(error)}`,
-					{ retryable: true },
-				);
-			} finally {
-				clearTimeout(timer);
-				signal.removeEventListener("abort", relayAbort);
-			}
+				const attemptController = new AbortController();
+				let timedOut = false;
+				const relayAbort = () => attemptController.abort();
+				signal.addEventListener("abort", relayAbort, { once: true });
+				const timer = setTimeout(() => {
+					timedOut = true;
+					attemptController.abort();
+				}, REQUEST_TIMEOUT_MS);
+				try {
+					const response = await fetch(url, {
+						method: "GET",
+						cache: "no-store",
+						signal: attemptController.signal,
+					});
+					if (!response.ok) {
+						const retryAfter = retryAfterMs(response);
+						throw new PageRequestError(
+							`HTTP ${response.status}：${new URL(url).pathname}${new URL(url).search}`,
+							{
+								status: response.status,
+								retryable: isRetryableStatus(response.status),
+								retryAfterMs: retryAfter,
+							},
+						);
+					}
+					return (await response.json()) as T;
+				} catch (requestError) {
+					if (signal.aborted) throw abortError();
+					if (requestError instanceof PageRequestError) throw requestError;
+					throw new PageRequestError(
+						timedOut
+							? `请求超时（${REQUEST_TIMEOUT_MS / 1_000} 秒）：${new URL(url).pathname}`
+							: `网络请求失败：${requestError instanceof Error ? requestError.message : String(requestError)}`,
+						{ retryable: true },
+					);
+				} finally {
+					clearTimeout(timer);
+					signal.removeEventListener("abort", relayAbort);
+				}
+			}, signal),
+		{
+			maxAttempts: MAX_REQUEST_ATTEMPTS,
+			signal,
+			onRetry: (requestError) => {
+				if (
+					requestError instanceof PageRequestError &&
+					requestError.status === 429
+				) {
+					scheduler.penalize(requestError.retryAfterMs ?? 2_000);
+				}
+			},
 		},
-		{ maxAttempts: MAX_REQUEST_ATTEMPTS, signal },
 	);
 }
 
@@ -247,75 +305,181 @@ function buildUrl(
 	query: Record<string, string>,
 ): string {
 	const url = new URL(path, `${baseUrl.replace(/\/$/, "")}/`);
-	for (const [key, value] of Object.entries(query)) {
+	for (const [key, value] of Object.entries(query))
 		url.searchParams.set(key, value);
-	}
 	return url.toString();
 }
 
-function rangePages(fromPage: number, toPage: number): number[] {
-	if (toPage < fromPage) return [];
-	return Array.from(
-		{ length: toPage - fromPage + 1 },
-		(_, index) => fromPage + index,
-	);
+function candidateSummary(
+	candidates: Map<string, PersistedCandidate>,
+	downloaded: number,
+): Summary {
+	let floors = 0;
+	let nested = 0;
+	let threads = 0;
+	let unknown = 0;
+	for (const candidate of candidates.values()) {
+		if (candidate.status === "floor") floors++;
+		else if (candidate.status === "nested") nested++;
+		else if (candidate.status === "thread") threads++;
+		else if (candidate.status === "unknown") unknown++;
+	}
+	return {
+		downloaded,
+		inPeriod: candidates.size,
+		floors,
+		nested,
+		threads,
+		unknown,
+	};
 }
 
-/** Independent panel; existing analysis, filters, heatmap and word cloud stay intact. */
+function confirmedPosts(
+	candidates: Map<string, PersistedCandidate>,
+): DateReplyPost[] {
+	return [...candidates.values()]
+		.filter(
+			(candidate) =>
+				candidate.status === "floor" || candidate.status === "nested",
+		)
+		.map((candidate) => candidate.post)
+		.sort((left, right) => right.createTime - left.createTime);
+}
+
+function progressFromState(
+	task: HistoricalTaskV3,
+	candidates: Map<string, PersistedCandidate>,
+): PipelineProgress {
+	const pages = task.boundary
+		? rangePages(task.boundary.fromPage, task.boundary.toPage)
+		: [];
+	let pagesSucceeded = 0;
+	let pagesFailed = 0;
+	let cacheHits = 0;
+	for (const page of pages) {
+		const status = task.pageStates[String(page)]?.status;
+		if (status === "failed") pagesFailed++;
+		else if (status) {
+			pagesSucceeded++;
+			if (status === "cached" || status === "located") cacheHits++;
+		}
+	}
+	let classified = 0;
+	let confirmed = 0;
+	let unknown = 0;
+	for (const candidate of candidates.values()) {
+		if (candidate.status !== "pending") classified++;
+		if (candidate.status === "floor" || candidate.status === "nested")
+			confirmed++;
+		if (candidate.status === "unknown") unknown++;
+	}
+	return {
+		targetPages: pages.length,
+		pagesSettled: pagesSucceeded + pagesFailed,
+		pagesSucceeded,
+		pagesFailed,
+		cacheHits,
+		candidates: candidates.size,
+		classified,
+		confirmed,
+		unknown,
+	};
+}
+
+function failedPageNumbers(task: HistoricalTaskV3): number[] {
+	return Object.entries(task.pageStates)
+		.filter(([, state]) => state.status === "failed")
+		.map(([page]) => Number(page))
+		.sort((left, right) => left - right);
+}
+
+/** Independent panel; original analysis, filters, heatmap and word cloud stay intact. */
 export function DateRangeReplyCollector({ method, id }: Props) {
 	const defaults = useMemo(() => defaultDateRange(), []);
 	const [startDate, setStartDate] = useState(defaults.startDate);
 	const [endDate, setEndDate] = useState(defaults.endDate);
+	const [pageConcurrency, setPageConcurrency] = useState(6);
+	const [classificationConcurrency, setClassificationConcurrency] = useState(3);
 	const [running, setRunning] = useState(false);
-	const [progress, setProgress] = useState(
-		"选择日期后开始抓取；成功页和任务进度会保存在浏览器 IndexedDB。",
-	);
+	const [message, setMessage] = useState("请选择不超过一个自然月的日期范围。");
 	const [error, setError] = useState("");
 	const [summary, setSummary] = useState<Summary>(EMPTY_SUMMARY);
 	const [results, setResults] = useState<DateReplyPost[]>([]);
-	const [task, setTask] = useState<TaskRecord | null>(null);
+	const [task, setTask] = useState<HistoricalTaskV3 | null>(null);
+	const [progress, setProgress] = useState<PipelineProgress>(
+		createEmptyProgress(),
+	);
 	const controllerRef = useRef<AbortController | null>(null);
 	const runIdRef = useRef(0);
-	const taskRef = useRef<TaskRecord | null>(null);
 	const scope = taskScope(method, id, startDate, endDate);
+	const query = useMemo<HistoricalTaskQuery>(
+		() => ({ method, id, startDate, endDate }),
+		[method, id, startDate, endDate],
+	);
+	const dateValidation = useMemo(() => {
+		try {
+			return { value: validateDateRange(startDate, endDate), error: "" };
+		} catch (dateError) {
+			return {
+				value: undefined,
+				error:
+					dateError instanceof Error ? dateError.message : String(dateError),
+			};
+		}
+	}, [startDate, endDate]);
+	const maximumEndDate = useMemo(() => {
+		try {
+			return maxEndDateForStart(startDate);
+		} catch {
+			return undefined;
+		}
+	}, [startDate]);
 
 	useEffect(() => {
 		const loadId = ++runIdRef.current;
 		controllerRef.current?.abort();
 		setRunning(false);
 		setTask(null);
-		taskRef.current = null;
 		setResults([]);
 		setSummary(EMPTY_SUMMARY);
+		setProgress(createEmptyProgress());
 		setError("");
-		setProgress("正在读取本地断点……");
 		if (!id) {
-			setProgress("请先查询一个用户，再选择日期范围。");
+			setMessage("请先查询一个用户。");
 			return;
 		}
+		setMessage("正在读取 IndexedDB 断点……");
 		Promise.all([
-			cacheGet<TaskRecord>(taskKey(scope)),
+			cacheGet<unknown>(taskKey(scope)),
 			cacheGet<StoredResult>(resultKey(scope)),
 		])
-			.then(([storedTask, storedResult]) => {
+			.then(async ([rawTask, storedResult]) => {
 				if (loadId !== runIdRef.current) return;
-				if (storedTask?.version === 2) {
-					setTask(storedTask);
-					taskRef.current = storedTask;
-					const missing = Object.keys(storedTask.failedPages).length;
-					if (storedTask.phase === "complete") {
-						setProgress("已从 IndexedDB 恢复完成的任务。");
-					} else if (storedTask.phase === "partial") {
-						setProgress(`已恢复部分完成的任务，仍缺失 ${missing} 页。`);
-					} else {
-						setProgress("已恢复上次进度，可继续抓取。");
+				const restored = migrateHistoricalTask(rawTask, query);
+				if (restored) {
+					const entries = await cacheEntriesPrefix<PersistedCandidate>(
+						candidatePrefix(scope, restored.snapshotId),
+					);
+					if (loadId !== runIdRef.current) return;
+					const candidates = new Map(
+						entries.map(({ value }) => [postIdentity(value.post), value]),
+					);
+					setTask(restored);
+					setProgress(progressFromState(restored, candidates));
+					if (candidates.size > 0) {
+						setResults(confirmedPosts(candidates));
+						setSummary(candidateSummary(candidates, 0));
+					} else if (storedResult) {
+						setResults(storedResult.posts);
+						setSummary(storedResult.summary);
 					}
+					setMessage(
+						restored.requiresRelocation
+							? "检测到旧版任务；结果已保留，继续时会安全地重新定位。"
+							: `已恢复 ${restored.phase} 任务。`,
+					);
 				} else {
-					setProgress("日期范围已就绪，可以开始抓取。");
-				}
-				if (storedResult) {
-					setResults(storedResult.posts);
-					setSummary(storedResult.summary);
+					setMessage("日期范围已就绪，可以开始定位。");
 				}
 			})
 			.catch((loadError) => {
@@ -327,20 +491,13 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 			controllerRef.current?.abort();
 			runIdRef.current++;
 		};
-	}, [id, scope]);
+	}, [id, query, scope]);
 
-	async function run(retryFailedOnly = false) {
-		if (!id || running) return;
-		let dateBounds: { startMs: number; endExclusiveMs: number };
-		try {
-			dateBounds = chinaDateBounds(startDate, endDate);
-		} catch (dateError) {
-			setError(
-				dateError instanceof Error ? dateError.message : String(dateError),
-			);
+	async function run(mode: RunMode) {
+		if (!id || running || !dateValidation.value) {
+			if (!dateValidation.value) setError(dateValidation.error);
 			return;
 		}
-
 		const controller = new AbortController();
 		controllerRef.current = controller;
 		const { signal } = controller;
@@ -348,24 +505,18 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 		setRunning(true);
 		setError("");
 
-		let workingTask = await cacheGet<TaskRecord>(taskKey(scope));
-		if (!workingTask || workingTask.version !== 2) {
-			workingTask = {
-				version: 2,
-				query: { method, id, startDate, endDate },
-				phase: "locating",
-				checkedPages: [],
-				failedPages: {},
-				probeCount: 0,
-				updatedAt: Date.now(),
-			};
-		}
+		let workingTask: HistoricalTaskV3 | undefined;
+		const requireWorkingTask = (): HistoricalTaskV3 => {
+			if (!workingTask) throw new Error("任务尚未初始化");
+			return workingTask;
+		};
 		let mutation = Promise.resolve();
-		const mutateTask = async (change: (current: TaskRecord) => void) => {
+		const mutateTask = async (change: (current: HistoricalTaskV3) => void) => {
+			if (!workingTask) throw new Error("任务尚未初始化");
 			mutation = mutation.then(async () => {
+				if (!workingTask) return;
 				change(workingTask);
 				workingTask.updatedAt = Date.now();
-				taskRef.current = { ...workingTask };
 				setTask({ ...workingTask });
 				await cachePut(taskKey(scope), workingTask);
 			});
@@ -373,282 +524,402 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 		};
 
 		try {
+			const rawTask = await cacheGet<unknown>(taskKey(scope));
+			workingTask = migrateHistoricalTask(rawTask, query) ?? {
+				version: 3,
+				query,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+				phase: "LOCATING",
+				snapshotId: newSnapshotId(),
+				pageStates: {},
+				progress: createEmptyProgress(),
+			};
+			if (workingTask.requiresRelocation) {
+				workingTask.snapshotId = newSnapshotId();
+				workingTask.pageStates = {};
+				workingTask.progress = createEmptyProgress();
+				workingTask.boundary = undefined;
+				workingTask.anchor = undefined;
+				workingTask.requiresRelocation = false;
+			}
+			const candidateEntries = await cacheEntriesPrefix<PersistedCandidate>(
+				candidatePrefix(scope, workingTask.snapshotId),
+			);
+			let candidates = new Map(
+				candidateEntries.map(({ value }) => [postIdentity(value.post), value]),
+			);
+			const scheduler = new RequestScheduler({
+				requestsPerSecond: 5,
+				maxConcurrent: 5,
+			});
 			const baseUrl = await resolveApiBaseUrl();
-			const common = { method, id };
-			const fetchSinglePage = async (
+			let locationRequests = 0;
+			let classificationRequests = 0;
+			let networkFailures = 0;
+			const requestPage = async (
 				page: number,
-				requestSignal = signal,
-			): Promise<DateReplyPost[]> => {
-				const raw = await requestJson<unknown>(
-					buildUrl(baseUrl, "/user/posts", {
-						...common,
-						page: String(page),
-					}),
-					requestSignal,
-				);
-				return validPosts(raw);
-			};
-			const pageCache: PageCache = {
-				get: (page) => cacheGet<DateReplyPost[]>(pageKey(scope, page)),
-				put: async (page, posts) => {
-					await cachePut(pageKey(scope, page), posts);
-					await mutateTask((current) => {
-						if (!current.checkedPages.includes(page)) {
-							current.checkedPages = [...current.checkedPages, page].sort(
-								(left, right) => left - right,
-							);
-						}
-						delete current.failedPages[String(page)];
-					});
-				},
-				markFailed: async (failure) => {
-					await mutateTask((current) => {
-						current.failedPages[String(failure.page)] = {
-							...failure,
-							attempts: MAX_REQUEST_ATTEMPTS,
-						};
-					});
-				},
-				clearFailed: async (page) => {
-					await mutateTask((current) => {
-						delete current.failedPages[String(page)];
-						if (!current.checkedPages.includes(page)) {
-							current.checkedPages = [...current.checkedPages, page].sort(
-								(left, right) => left - right,
-							);
-						}
-					});
-				},
-			};
-			const getPageForLocation = async (page: number) => {
-				const cached = await pageCache.get(page);
-				if (cached !== undefined) return cached;
+				purpose: "anchor" | "locate" | "fetch",
+			) => {
+				if (purpose !== "fetch") locationRequests++;
 				try {
-					const posts = await fetchSinglePage(page);
-					await pageCache.put(page, posts);
-					return posts;
+					return validPosts(
+						await requestJson<unknown>(
+							buildUrl(baseUrl, "/user/posts", {
+								method,
+								id,
+								page: String(page),
+							}),
+							signal,
+							scheduler,
+						),
+					);
 				} catch (pageError) {
-					if (isAbortError(pageError)) throw pageError;
-					await pageCache.markFailed({
-						page,
-						attempts: MAX_REQUEST_ATTEMPTS,
-						message:
-							pageError instanceof Error
-								? pageError.message
-								: String(pageError),
-						updatedAt: Date.now(),
-					});
+					if (!isAbortError(pageError)) networkFailures++;
 					throw pageError;
 				}
 			};
+			const resolveFirstFloor = createFirstFloorResolver({
+				getCached: (threadId) => cacheGet<string>(firstFloorKey(threadId)),
+				load: async (threadId) => {
+					classificationRequests++;
+					try {
+						return firstFloorId(
+							await requestJson<unknown>(
+								buildUrl(baseUrl, "/post/raw", { tid: threadId, page: "1" }),
+								signal,
+								scheduler,
+							),
+						);
+					} catch (classificationError) {
+						if (!isAbortError(classificationError)) networkFailures++;
+						throw classificationError;
+					}
+				},
+				persist: (threadId, value) => cachePut(firstFloorKey(threadId), value),
+			});
+			const classifyReply = createReplyClassifier(resolveFirstFloor);
+
+			let lastViewUpdate = 0;
+			const updateView = (force = false) => {
+				if (!workingTask) return;
+				const now = Date.now();
+				if (!force && now - lastViewUpdate < 100) return;
+				lastViewUpdate = now;
+				const currentProgress = progressFromState(workingTask, candidates);
+				workingTask.progress = currentProgress;
+				setProgress(currentProgress);
+				setSummary(candidateSummary(candidates, 0));
+				setResults(confirmedPosts(candidates));
+			};
+
+			const persistClassification = async (result: {
+				post: DateReplyPost;
+				kind: ReplyKind;
+				error?: string;
+			}) => {
+				const value: PersistedCandidate = {
+					post: result.post,
+					status: result.kind,
+					updatedAt: Date.now(),
+					...(result.error && { error: result.error }),
+				};
+				candidates.set(postIdentity(result.post), value);
+				await cachePut(
+					candidateKey(scope, requireWorkingTask().snapshotId, result.post),
+					value,
+				);
+				updateView();
+			};
+
+			if (mode === "unknown") {
+				const unknownPosts = [...candidates.values()]
+					.filter((candidate) => candidate.status === "unknown")
+					.map((candidate) => candidate.post);
+				await mutateTask((current) => {
+					current.phase = "VERIFYING";
+				});
+				setMessage(`正在重试 ${unknownPosts.length} 条待核验记录……`);
+				await runClassificationPool({
+					posts: unknownPosts,
+					classify: classifyReply,
+					concurrency: classificationConcurrency,
+					signal,
+					onClassified: persistClassification,
+				});
+				await finalizeTask(workingTask, candidates, undefined, mutateTask);
+				updateView(true);
+				setMessage("待核验记录重试完成。");
+				return;
+			}
+
+			if (workingTask.anchor && workingTask.boundary) {
+				try {
+					const anchorPage = workingTask.anchor.page;
+					const freshAnchor = await requestPage(anchorPage, "anchor");
+					if (pageMappingDrifted(workingTask.anchor.fingerprint, freshAnchor)) {
+						workingTask.snapshotId = newSnapshotId();
+						workingTask.boundary = undefined;
+						workingTask.pageStates = {};
+						workingTask.progress = createEmptyProgress();
+						workingTask.anchor = undefined;
+						candidates = new Map();
+						setResults([]);
+						setSummary(EMPTY_SUMMARY);
+						await cachePut(
+							pageKey(scope, workingTask.snapshotId, anchorPage),
+							freshAnchor,
+						);
+						workingTask.pageStates[String(anchorPage)] = {
+							status: "located",
+							updatedAt: Date.now(),
+						};
+						workingTask.anchor = {
+							page: anchorPage,
+							fingerprint: pageFingerprint(freshAnchor),
+						};
+						setMessage("检测到贴吧页码映射变化，已启用新快照并重新定位。");
+					} else {
+						await cachePut(
+							pageKey(scope, workingTask.snapshotId, workingTask.anchor.page),
+							freshAnchor,
+						);
+					}
+				} catch (anchorError) {
+					if (workingTask.boundary) workingTask.boundary.uncertain = true;
+					setError(
+						`无法验证页码锚点，本次结果不会标记 COMPLETE：${anchorError instanceof Error ? anchorError.message : String(anchorError)}`,
+					);
+				}
+			}
 
 			if (
-				workingTask.fromPage === undefined ||
-				workingTask.toPage === undefined
+				mode === "all" &&
+				workingTask.boundary?.uncertain &&
+				failedPageNumbers(workingTask).length === 0
 			) {
-				if (retryFailedOnly) {
-					const probeFailures = Object.keys(workingTask.failedPages).map(
-						Number,
-					);
-					if (probeFailures.length > 0) {
-						setProgress(`正在重试 ${probeFailures.length} 个定位失败页……`);
-						await collectPages({
-							pages: probeFailures,
-							fetchPage: fetchSinglePage,
-							cache: pageCache,
-							concurrency: 2,
-							signal,
-						});
-					}
-				}
-				setProgress("正在指数跳页并二分定位日期边界……");
+				workingTask.boundary = undefined;
+			}
+
+			const getLocatedPage = async (page: number): Promise<DateReplyPost[]> => {
+				const key = pageKey(scope, requireWorkingTask().snapshotId, page);
+				const cached = await cacheGet<DateReplyPost[]>(key);
+				if (cached !== undefined) return cached;
+				const posts = await requestPage(page, "locate");
+				await cachePut(key, posts);
+				await mutateTask((current) => {
+					current.pageStates[String(page)] = {
+						status: "located",
+						updatedAt: Date.now(),
+					};
+				});
+				return posts;
+			};
+
+			if (!workingTask.boundary) {
+				await mutateTask((current) => {
+					current.phase = "LOCATING";
+				});
+				setMessage("正在指数扩张并二分定位两个日期边界……");
 				const located = await locatePages(
-					getPageForLocation,
-					dateBounds.startMs,
-					dateBounds.endExclusiveMs,
-					setProgress,
+					getLocatedPage,
+					dateValidation.value.startMs,
+					dateValidation.value.endExclusiveMs,
+					(messageText) => setMessage(messageText),
 				);
 				if (located.unresolved) {
 					await mutateTask((current) => {
-						delete current.fromPage;
-						delete current.toPage;
-						current.probeCount = located.probeCount;
-						current.phase = "partial";
+						current.phase = "PARTIAL";
+						for (const page of located.failedPages) {
+							current.pageStates[String(page)] = {
+								status: "failed",
+								updatedAt: Date.now(),
+								message: "定位探测失败",
+							};
+						}
 					});
-					const missingCount = Object.keys(workingTask.failedPages).length;
-					setProgress(
-						`部分完成：日期边界仍无法安全定位，保留 ${missingCount} 个失败探测页。请稍后重试失败页。`,
-					);
+					setMessage("PARTIAL：无法可靠确定日期边界，请稍后重试。");
 					return;
 				}
-				await mutateTask((current) => {
-					current.fromPage = located.fromPage;
-					current.toPage = located.toPage;
-					current.probeCount = located.probeCount;
-					current.phase = "collecting";
-					for (const page of Object.keys(current.failedPages).map(Number)) {
-						if (page < located.fromPage || page > located.toPage) {
-							delete current.failedPages[String(page)];
-						}
-					}
-				});
-			}
-
-			const fromPage = workingTask.fromPage;
-			const toPage = workingTask.toPage;
-			if (fromPage === undefined || toPage === undefined) {
-				throw new Error("任务缺少日期页码边界");
-			}
-			const allPages = rangePages(fromPage, toPage);
-			const failedPageNumbers = Object.keys(workingTask.failedPages).map(
-				Number,
-			);
-			const pagesToFetch = retryFailedOnly ? failedPageNumbers : allPages;
-
-			if (pagesToFetch.length > 0) {
-				await mutateTask((current) => {
-					current.phase = "collecting";
-				});
-				await collectPages({
-					pages: pagesToFetch,
-					fetchPage: fetchSinglePage,
-					cache: pageCache,
-					concurrency: 2,
-					signal,
-					onProgress: (completed, total, page) => {
-						setProgress(
-							`单页低并发抓取：${completed}/${total}（刚检查第 ${page} 页）`,
-						);
-					},
-				});
-			}
-
-			const allPosts: DateReplyPost[] = [];
-			const missingPages: number[] = [];
-			for (const page of allPages) {
-				const posts = await pageCache.get(page);
-				if (posts === undefined) missingPages.push(page);
-				else allPosts.push(...posts);
-			}
-			await mutateTask((current) => {
-				for (const page of missingPages) {
-					current.failedPages[String(page)] ??= {
-						page,
-						attempts: MAX_REQUEST_ATTEMPTS,
-						message: "该页尚未成功保存",
+				workingTask.boundary = {
+					fromPage: located.fromPage,
+					toPage: located.toPage,
+					uncertain: located.boundaryUncertain,
+					orderingVerified: located.orderingVerified,
+					probeCount: located.probeCount,
+					notes: located.notes,
+				};
+				for (const page of located.failedPages) {
+					workingTask.pageStates[String(page)] = {
+						status: "failed",
 						updatedAt: Date.now(),
+						message: "定位探测失败",
 					};
 				}
-				current.phase = "classifying";
-			});
-
-			const inPeriod = uniquePosts(
-				filterDate(allPosts, dateBounds.startMs, dateBounds.endExclusiveMs),
-			);
-			setProgress(
-				`已筛出 ${inPeriod.length} 条日期内记录，正在核实主题帖与回复……`,
-			);
-			const firstFloorMemory = new Map<string, string | null>();
-			const readFirstFloor = async (
-				threadId: string,
-			): Promise<string | null> => {
-				if (firstFloorMemory.has(threadId)) {
-					return firstFloorMemory.get(threadId) ?? null;
+				const anchorPosts = await cacheGet<DateReplyPost[]>(
+					pageKey(scope, workingTask.snapshotId, 1),
+				);
+				if (anchorPosts) {
+					workingTask.anchor = {
+						page: 1,
+						fingerprint: pageFingerprint(anchorPosts),
+					};
 				}
-				const cached = await cacheGet<string>(firstFloorKey(threadId));
-				if (cached !== undefined) {
-					firstFloorMemory.set(threadId, cached);
-					return cached;
-				}
-				try {
-					const raw = await requestJson<unknown>(
-						buildUrl(baseUrl, "/post/raw", { tid: threadId, page: "1" }),
-						signal,
-					);
-					const value = firstFloorId(raw);
-					firstFloorMemory.set(threadId, value);
-					if (value) await cachePut(firstFloorKey(threadId), value);
-					return value;
-				} catch (classifyError) {
-					if (isAbortError(classifyError)) throw classifyError;
-					firstFloorMemory.set(threadId, null);
-					return null;
-				}
-			};
-
-			let floors = 0;
-			let nested = 0;
-			let threads = 0;
-			let unknown = 0;
-			const verified: DateReplyPost[] = [];
-			for (let index = 0; index < inPeriod.length; index++) {
-				if (signal.aborted) throw abortError();
-				const post = inPeriod[index];
-				const firstId = post.affiliated
-					? null
-					: await readFirstFloor(post.threadId);
-				const kind = replyKind(post, firstId);
-				if (kind === "floor") {
-					floors++;
-					verified.push(post);
-				} else if (kind === "nested") {
-					nested++;
-					verified.push(post);
-				} else if (kind === "thread") {
-					threads++;
-				} else {
-					unknown++;
-				}
-				if (index % 10 === 0 || index === inPeriod.length - 1) {
-					setProgress(
-						`分类 ${index + 1}/${inPeriod.length}：确认回复 ${floors + nested}，主题帖 ${threads}，无法核实 ${unknown}`,
-					);
-				}
+				await mutateTask((current) => {
+					current.phase = "FETCHING";
+				});
 			}
 
-			const finalSummary: Summary = {
-				downloaded: allPosts.length,
-				inPeriod: inPeriod.length,
-				floors,
-				nested,
-				threads,
-				unknown,
-			};
-			setResults(verified);
-			setSummary(finalSummary);
-			await cachePut(resultKey(scope), {
-				posts: verified,
-				summary: finalSummary,
-			} satisfies StoredResult);
-			const missingCount = Object.keys(workingTask.failedPages).length;
+			const boundary = workingTask.boundary;
+			if (!boundary) throw new Error("定位结果缺少页码边界");
+			const allTargetPages = rangePages(boundary.fromPage, boundary.toPage);
+			const targetPages =
+				mode === "failed"
+					? failedPageNumbers(workingTask).filter(
+							(page) => page >= boundary.fromPage && page <= boundary.toPage,
+						)
+					: allTargetPages;
 			await mutateTask((current) => {
-				current.phase = missingCount === 0 ? "complete" : "partial";
+				current.phase = "FETCHING";
+				current.progress.targetPages = allTargetPages.length;
 			});
-			if (missingCount === 0) {
-				setProgress(
-					`抓取完成：日期区间所有 ${allPages.length} 页均已成功检查，保留 ${verified.length} 条确认回复。`,
-				);
-			} else {
-				setProgress(
-					`部分完成：仍有 ${missingCount} 页未成功检查；当前保留 ${verified.length} 条确认回复。请使用“重试失败页”。`,
-				);
-			}
-			if (unknown > 0) {
-				setError(
-					`${unknown} 条非楼中楼记录因主题首楼不可访问而无法核实，已排除，未假定为回复。`,
-				);
-			}
+			setMessage(
+				`目标范围第 ${boundary.fromPage}–${boundary.toPage} 页；抓取与分类正在并行执行。`,
+			);
+
+			let classifiedSinceCheckpoint = 0;
+			const pipelineResult = await runStreamingReplyPipeline({
+				pages: targetPages,
+				startMs: dateValidation.value.startMs,
+				endExclusiveMs: dateValidation.value.endExclusiveMs,
+				pageConcurrency,
+				classificationConcurrency,
+				queueCapacity: Math.max(60, classificationConcurrency * 30),
+				signal,
+				loadPage: async (page) => {
+					const currentTask = requireWorkingTask();
+					const key = pageKey(scope, currentTask.snapshotId, page);
+					const cached = await cacheGet<DateReplyPost[]>(key);
+					if (cached !== undefined) {
+						return {
+							posts: cached,
+							source:
+								currentTask.pageStates[String(page)]?.status === "located"
+									? "located"
+									: "cache",
+						} as const;
+					}
+					const legacy = await cacheGet<DateReplyPost[]>(
+						legacyPageKey(scope, page),
+					);
+					if (
+						legacy !== undefined &&
+						currentTask.snapshotId.startsWith("migrated-")
+					) {
+						return { posts: legacy, source: "cache" } as const;
+					}
+					const posts = await requestPage(page, "fetch");
+					await cachePut(key, posts);
+					return { posts, source: "network" } as const;
+				},
+				classify: async (post, classifySignal) => {
+					const existing = candidates.get(postIdentity(post));
+					if (
+						existing &&
+						existing.status !== "pending" &&
+						existing.status !== "unknown"
+					) {
+						return existing.status;
+					}
+					return classifyReply(post, classifySignal);
+				},
+				onPage: async (page, status, detail) => {
+					await mutateTask((current) => {
+						current.pageStates[String(page)] =
+							status === "failed"
+								? {
+										status: "failed",
+										updatedAt: Date.now(),
+										message: "message" in detail ? detail.message : "页面失败",
+									}
+								: {
+										status:
+											"source" in detail
+												? detail.source === "network"
+													? "success"
+													: detail.source === "located"
+														? "located"
+														: "cached"
+												: "cached",
+										updatedAt: Date.now(),
+									};
+					});
+					updateView();
+				},
+				onCandidates: async (posts) => {
+					const additions: Array<{ key: string; value: PersistedCandidate }> =
+						[];
+					for (const post of posts) {
+						const identity = postIdentity(post);
+						if (candidates.has(identity)) continue;
+						const value: PersistedCandidate = {
+							post,
+							status: "pending",
+							updatedAt: Date.now(),
+						};
+						candidates.set(identity, value);
+						additions.push({
+							key: candidateKey(scope, requireWorkingTask().snapshotId, post),
+							value,
+						});
+					}
+					await cachePutMany(additions);
+					updateView();
+				},
+				onClassified: async (classified) => {
+					await persistClassification(classified);
+					classifiedSinceCheckpoint++;
+					if (classifiedSinceCheckpoint >= 10) {
+						classifiedSinceCheckpoint = 0;
+						await mutateTask((current) => {
+							current.progress = progressFromState(current, candidates);
+						});
+					}
+				},
+			});
+			pipelineResult.metrics.locationRequests = locationRequests;
+			pipelineResult.metrics.classificationRequests = classificationRequests;
+			pipelineResult.metrics.totalHttpAttempts = scheduler.stats().started;
+			pipelineResult.metrics.networkFailures = networkFailures;
+			workingTask.metrics = pipelineResult.metrics;
+			await finalizeTask(workingTask, candidates, pipelineResult, mutateTask);
+			updateView(true);
+			const finalStatus = workingTask.phase;
+			setMessage(
+				`${finalStatus}：目标页 ${workingTask.progress.pagesSucceeded}/${workingTask.progress.targetPages}，确认回复 ${workingTask.progress.confirmed}，待核验 ${workingTask.progress.unknown}。`,
+			);
+			await cachePut(resultKey(scope), {
+				posts: confirmedPosts(candidates),
+				summary: candidateSummary(candidates, 0),
+			} satisfies StoredResult);
 		} catch (runError) {
 			if (isAbortError(runError) || signal.aborted) {
-				await mutateTask((current) => {
-					current.phase = "paused";
-				});
-				setProgress("已暂停；成功页和当前进度已保存，可继续抓取。");
+				if (workingTask) {
+					await mutateTask((current) => {
+						current.phase = "PAUSED";
+					});
+				}
+				setMessage("PAUSED：页面、候选记录和分类进度均已保存。");
 			} else {
+				if (workingTask) {
+					await mutateTask((current) => {
+						current.phase = "ERROR";
+					});
+				}
 				setError(
 					runError instanceof Error ? runError.message : String(runError),
 				);
-				setProgress("任务遇到错误；已保存成功页，可稍后继续。");
+				setMessage("ERROR：任务状态已保存，可修复后继续。");
 			}
 		} finally {
 			if (runId === runIdRef.current) setRunning(false);
@@ -660,23 +931,21 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 		try {
 			await cacheDeletePrefix(`date-replies:task:${scope}`);
 			await cacheDeletePrefix(`date-replies:page:${scope}:`);
+			await cacheDeletePrefix(`date-replies:candidate:${scope}:`);
 			await cacheDeletePrefix(`date-replies:result:${scope}`);
 			setTask(null);
-			taskRef.current = null;
 			setResults([]);
 			setSummary(EMPTY_SUMMARY);
+			setProgress(createEmptyProgress());
 			setError("");
-			setProgress("已清除当前用户和日期范围的任务缓存。");
+			setMessage("已清除当前用户和日期范围的任务缓存；其他任务未受影响。");
 		} catch (clearError) {
 			setError(`清除任务缓存失败：${String(clearError)}`);
 		}
 	}
 
-	const failedPages = task
-		? Object.values(task.failedPages).sort(
-				(left, right) => left.page - right.page,
-			)
-		: [];
+	const failures = task ? failedPageNumbers(task) : [];
+	const complete = task?.phase === "COMPLETE";
 	const formatter = new Intl.DateTimeFormat("zh-CN", {
 		timeZone: "Asia/Shanghai",
 		year: "numeric",
@@ -688,10 +957,9 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 
 	return (
 		<section className={styles.panel} aria-label="历史回复按日期抓取">
-			<h3 className={styles.heading}>历史回复 · 指定日期抓取</h3>
+			<h3 className={styles.heading}>历史回复 · 定向流式抓取</h3>
 			<p className={styles.intro}>
-				使用单页独立请求和低并发抓取。HTTP
-				500、429、超时会指数退避重试；失败页会跳过并保存，不会中止整个任务。
+				指数定位日期边界后只抓目标页；页面下载、日期筛选、去重、持久化和回复核验会流水并行执行。
 			</p>
 			<div className={styles.controls}>
 				<label className={styles.dateField}>
@@ -710,25 +978,72 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 						className={styles.dateInput}
 						type="date"
 						value={endDate}
+						max={maximumEndDate}
 						disabled={running}
 						onChange={(event) => setEndDate(event.target.value)}
 					/>
+					<span className={styles.hint}>最晚 {maximumEndDate ?? "—"}</span>
 				</label>
+				<label className={styles.dateField}>
+					页面并发（1–8）
+					<input
+						className={styles.numberInput}
+						type="number"
+						min={1}
+						max={8}
+						value={pageConcurrency}
+						disabled={running}
+						onChange={(event) =>
+							setPageConcurrency(
+								Math.max(1, Math.min(8, Number(event.target.value))),
+							)
+						}
+					/>
+				</label>
+				<label className={styles.dateField}>
+					核验并发（1–4）
+					<input
+						className={styles.numberInput}
+						type="number"
+						min={1}
+						max={4}
+						value={classificationConcurrency}
+						disabled={running}
+						onChange={(event) =>
+							setClassificationConcurrency(
+								Math.max(1, Math.min(4, Number(event.target.value))),
+							)
+						}
+					/>
+				</label>
+			</div>
+			{dateValidation.error && (
+				<p className={styles.error}>{dateValidation.error}</p>
+			)}
+			<div className={styles.actions}>
 				<button
 					className={`${styles.button} ${styles.primary}`}
 					type="button"
-					disabled={!id || running}
-					onClick={() => void run(false)}
+					disabled={!id || running || Boolean(dateValidation.error)}
+					onClick={() => void run("all")}
 				>
-					{task ? "继续/读取缓存" : "开始抓取"}
+					{task ? "继续抓取" : "开始抓取"}
 				</button>
 				<button
 					className={styles.button}
 					type="button"
-					disabled={running || failedPages.length === 0}
-					onClick={() => void run(true)}
+					disabled={running || failures.length === 0}
+					onClick={() => void run("failed")}
 				>
-					重试失败页{failedPages.length > 0 ? `（${failedPages.length}）` : ""}
+					重试失败页（{failures.length}）
+				</button>
+				<button
+					className={styles.button}
+					type="button"
+					disabled={running || progress.unknown === 0}
+					onClick={() => void run("unknown")}
+				>
+					重试待核验回复（{progress.unknown}）
 				</button>
 				<button
 					className={styles.button}
@@ -749,24 +1064,47 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 			</div>
 
 			<p className={styles.progress} aria-live="polite">
-				{progress}
+				{message}
 			</p>
 			{task && (
+				<div className={styles.progressGrid}>
+					<span>状态：{task.phase}</span>
+					<span>定位探测：{task.boundary?.probeCount ?? 0}</span>
+					<span>
+						目标范围：
+						{task.boundary
+							? `第 ${task.boundary.fromPage}–${task.boundary.toPage} 页`
+							: "定位中"}
+					</span>
+					<span>
+						目标页成功：{progress.pagesSucceeded} / {progress.targetPages}
+					</span>
+					<span>失败页：{progress.pagesFailed}</span>
+					<span>缓存命中页：{progress.cacheHits}</span>
+					<span>日期内候选：{progress.candidates}</span>
+					<span>已分类：{progress.classified}</span>
+					<span>已确认回复：{progress.confirmed}</span>
+					<span>待核验：{progress.unknown}</span>
+				</div>
+			)}
+			{task?.metrics && (
 				<p className={styles.note}>
-					状态：
-					{task.phase === "complete"
-						? "抓取完成"
-						: task.phase === "partial"
-							? `部分完成（缺失 ${failedPages.length} 页）`
-							: task.phase}
-					；页码范围：{task.fromPage ?? "定位中"}–{task.toPage ?? "定位中"}
-					；成功页：{task.checkedPages.length}；定位探测：{task.probeCount}
+					性能：定位/锚点请求 {task.metrics.locationRequests ?? 0}；正式页面请求
+					{task.metrics.pageRequests}；分类额外请求
+					{task.metrics.classificationRequests ?? 0}；缓存命中
+					{task.metrics.cacheHits}；HTTP 尝试{" "}
+					{task.metrics.totalHttpAttempts ?? 0}；耗时
+					{Math.max(0, task.metrics.finishedAt - task.metrics.startedAt)} ms
 				</p>
 			)}
-			{failedPages.length > 0 && (
+			{task?.boundary?.uncertain && (
 				<p className={styles.warning}>
-					缺失页：{failedPages.map((failure) => failure.page).join("、")}
-					。这些页未被当成“没有更多发言”。
+					日期边界存在失败页或排序异常，结果不会标记 COMPLETE。
+				</p>
+			)}
+			{failures.length > 0 && (
+				<p className={styles.warning}>
+					缺失页：{failures.join("、")}。错误页未被当作空页或历史终点。
 				</p>
 			)}
 			{error && (
@@ -776,7 +1114,6 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 			)}
 
 			<div className={styles.stats}>
-				<span>下载记录：{summary.downloaded}</span>
 				<span>日期内去重：{summary.inPeriod}</span>
 				<span>楼层回复：{summary.floors}</span>
 				<span>楼中楼：{summary.nested}</span>
@@ -787,13 +1124,13 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 			{results.length > 0 && (
 				<div className={styles.results}>
 					<div className={styles.resultHeader}>
-						<h3>已确认的回复（{results.length}）</h3>
+						<h3>实时确认回复（{results.length}）</h3>
 						<button
 							className={styles.button}
 							type="button"
-							onClick={() => saveCsv(results, startDate, endDate)}
+							onClick={() => saveCsv(results, startDate, endDate, complete)}
 						>
-							导出 CSV
+							导出 CSV（{complete ? "完整" : "部分"}）
 						</button>
 					</div>
 					{results.length > MAX_SHOWN && (
@@ -803,10 +1140,7 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 					)}
 					<div className={styles.list}>
 						{results.slice(0, MAX_SHOWN).map((post) => (
-							<article
-								className={styles.item}
-								key={`${post.threadId}/${post.postId}/${post.cid}/${post.createTime}`}
-							>
+							<article className={styles.item} key={postIdentity(post)}>
 								<div className={styles.meta}>
 									<span>
 										{formatter.format(new Date(post.createTime * 1_000))}
@@ -830,4 +1164,36 @@ export function DateRangeReplyCollector({ method, id }: Props) {
 			)}
 		</section>
 	);
+}
+
+async function finalizeTask(
+	task: HistoricalTaskV3,
+	candidates: Map<string, PersistedCandidate>,
+	pipeline: StreamingPipelineResult | undefined,
+	mutateTask: (change: (current: HistoricalTaskV3) => void) => Promise<void>,
+) {
+	const currentProgress = progressFromState(task, candidates);
+	const pendingPages = Math.max(
+		0,
+		currentProgress.targetPages -
+			currentProgress.pagesSucceeded -
+			currentProgress.pagesFailed,
+	);
+	const pendingClassifications = Math.max(
+		0,
+		currentProgress.candidates - currentProgress.classified,
+	);
+	const phase = completionStatus({
+		boundaryUncertain: task.boundary?.uncertain ?? true,
+		orderingVerified: task.boundary?.orderingVerified ?? false,
+		pendingPages,
+		failedPages: currentProgress.pagesFailed,
+		pendingClassifications,
+		unknownClassifications: currentProgress.unknown,
+	});
+	await mutateTask((current) => {
+		current.progress = currentProgress;
+		current.phase = phase;
+		if (pipeline) current.metrics = pipeline.metrics;
+	});
 }
