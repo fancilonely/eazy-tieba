@@ -10,6 +10,7 @@ import {
 } from "@primer/octicons-react";
 import { useMemo, useState, useCallback, useRef } from "react";
 import { QueryForm } from "../components/QueryForm.tsx";
+import { DateRangeReplyCollector } from "../components/DateRangeReplyCollector.tsx";
 import { usePostsBatchInfinite } from "../hooks/queries.ts";
 import { userSearchSchema } from "../lib/search-schemas.ts";
 import { UserPostClass, type UserPost } from "../lib/user-post.ts";
@@ -419,6 +420,7 @@ function PostAnalysisPage() {
 		<div>
 			<h2 className={styles.heading}>用户发帖分析</h2>
 			<QueryForm />
+			<DateRangeReplyCollector method={method} id={id} />
 
 			{isFetching && !isFetchingNextPage && !hasData && (
 				<div className={styles.center}>
