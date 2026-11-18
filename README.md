@@ -29,7 +29,10 @@
 - 对无法可靠判断是否属于回复的记录进行明确提示，不会简单地把所有 `UserPost` 当作回复。
 
 ### 2. 用户近期发言查询
-
+The principle comes from the website 
+```http
+https://tb.anova.me/
+```
 工具页新增独立的用户发言查询功能，可按照贴吧用户名、用户 ID 或 UID 查询公开发言记录。
 
 主要特性：
